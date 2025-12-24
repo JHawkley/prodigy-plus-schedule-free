@@ -28,6 +28,8 @@ class CoreOptimiser(torch.optim.Optimizer):
         if kwargs['use_amos']:
             if kwargs['amos_c_coef'] < 0:
                 raise ValueError("Invalid amos_c_coef value: {}".format(kwargs['amos_c_coef']))
+            if kwargs['amos_d_coef'] < 0:
+                raise ValueError("Invalid amos_d_coef value: {}".format(kwargs['amos_d_coef']))
 
         self.try_hook_kohya_fbp()
 
@@ -247,6 +249,8 @@ class CoreOptimiser(torch.optim.Optimizer):
             # AMOS-specific state
             if group['use_amos']:
                 state['amos_decay'] = torch.zeros((1,), dtype=p.dtype, device=p.device)
+                # AMOS uses its own EMA of squared gradients for decay computation
+                state['amos_exp_avg_sq'] = torch.zeros((1,), dtype=p.dtype, device=p.device)
 
         return state, needs_init
 
@@ -275,7 +279,7 @@ class CoreOptimiser(torch.optim.Optimizer):
         return math.sqrt(1 / p.size(1))
 
     @torch.no_grad()
-    def compute_amos_dynamic_decay(self, p, grad, state, group, dlr, xy_step=None):
+    def compute_amos_dynamic_decay(self, p, grad, state, group):
         r"""Compute AMOS-style dynamic weight decay.
         
         Args:
@@ -283,47 +287,52 @@ class CoreOptimiser(torch.optim.Optimizer):
             grad: Gradient tensor
             state: Optimizer state
             group: Parameter group
-            dlr: Dynamic learning rate from Prodigy
-            xy_step: Schedule-Free xy_step factor (None for non-Schedule-Free mode)
+        
+        Returns:
+            Tuple of (decay_factor_d, gamma)
         """
         import math
         
         c_coef = group['amos_c_coef']
-        extra_l2 = group['weight_decay']
+        d_coef = group['amos_d_coef']
+        _, beta2, _ = self.get_betas(group)
+        k = group['k']
         eps = group['eps'] if group['eps'] is not None else 1e-18
         
-        # Compute mean squared gradient (current, not EMA)
+        # Compute mean squared gradient
         g2 = grad.pow(2).mean()
         
-        # Compute effective learning rate (actual step size)
-        if xy_step is not None:
-            # Schedule-Free mode
-            effective_lr = dlr * xy_step
-        else:
-            # Non-Schedule-Free mode
-            effective_lr = dlr
+        # Update AMOS's own EMA of squared gradients for decay computation
+        amos_exp_avg_sq = state['amos_exp_avg_sq']
+        amos_exp_avg_sq.mul_(beta2).add_(g2, alpha=1.0 - beta2)
+        
+        # Compute bias correction for AMOS EMA
+        bias_correction = 1.0 - (beta2 ** k)
+        
+        # Compute r_v_hat = bias_correction / (exp_avg_sq + eps)
+        # This is the inverse of the variance estimate
+        r_v_hat = bias_correction / (amos_exp_avg_sq + eps)
+
+        effective_lr = group['effective_lr']
         
         # Get decay state
         b = state['amos_decay']
-        
-        # Compute decay factor using effective_lr
+
+        init_lr = effective_lr * self.get_amos_scale(p)
+
         lr_sq = math.sqrt(effective_lr)
         decay_factor_c = torch.rsqrt(1.0 + c_coef * lr_sq * b)
         
-        # Compute gamma (dynamic weight decay strength)
-        # Note: AMOS also uses decay_factor_d to scale the entire update, but Prodigy's
-        # update mechanism (y.sub_(update, alpha=dlr)) doesn't support additional
-        # multiplicative factors. The temporal smoothing from decay_factor_d is partially
-        # captured by the amos_decay state accumulation. This is a simplified adaptation.
-        gamma = decay_factor_c * (effective_lr ** 2) * g2 / (g2 + eps)
+        # Compute decay_factor_d (scales the entire update)
+        decay_factor_d = torch.reciprocal(1.0 + d_coef * math.sqrt(init_lr) * b)
         
-        # Compute effective decay (applied as multiplicative factor to parameters)
-        effective_decay = (extra_l2 - gamma) / 2.0
+        # Compute gamma (dynamic weight decay strength)
+        gamma = decay_factor_c * (effective_lr ** 2) * r_v_hat * g2
         
         # Update decay state
         b.mul_(1.0 + gamma).add_(gamma)
         
-        return effective_decay
+        return decay_factor_d, gamma
 
     def get_bias_correction(self, dlr, beta2, k):
         beta2_t = beta2 ** k

@@ -169,6 +169,9 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
         amos_c_coef (float):
             Coefficient for AMOS decay_factor_c. Only used when use_amos=True.
             (default: 0.25)
+        amos_d_coef (float):
+            Coefficient for AMOS decay_factor_d. Only used when use_amos=True.
+            (default: 0.25)
     """
     def __init__(self, params, lr=1.0,
                  betas=(0.9, 0.99), beta3=None,
@@ -196,7 +199,8 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                  use_focus=False,
                  # AMOS parameters (experimental)
                  use_amos=False,
-                 amos_c_coef=0.25):
+                 amos_c_coef=0.25,
+                 amos_d_coef=0.25):
 
         super().__init__(params=params, lr=lr,
                         betas=betas, beta3=beta3,
@@ -223,7 +227,8 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                         use_orthograd=use_orthograd,
                         use_focus=use_focus,
                         use_amos=use_amos,
-                        amos_c_coef=amos_c_coef)
+                        amos_c_coef=amos_c_coef,
+                        amos_d_coef=amos_d_coef)
 
     @torch.no_grad()
     def set_train_mode(self, train):
@@ -373,9 +378,22 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             # Apply weight decay
             if use_amos:
                 # Non-Schedule-Free mode: xy_step = None
-                decay = self.compute_amos_dynamic_decay(p, p.grad, state, group, dlr, xy_step=None)
-                if decay != 0:
-                    y.mul_(1.0 - decay)
+                decay_factor_d, gamma = self.compute_amos_dynamic_decay(
+                    p, p.grad, state, group
+                )
+                extra_l2 = group['weight_decay']
+                
+                # Apply AMOS-style decay:
+                # 1. Scale the entire update by decay_factor_d
+                # 2. Apply dynamic weight decay to parameters
+                update.mul_(decay_factor_d)
+                
+                # Apply dynamic weight decay to parameters (similar to weight decay)
+                # Reference AMOS: update = p.clone().mul_((gamma - extra_l2) / 2.0) + ...
+                # We apply this as parameter decay
+                param_decay = (gamma - extra_l2) / 2.0
+                if param_decay != 0:
+                    y.mul_(1.0 - param_decay)
             else:
                 # Original Prodigy weight decay
                 decay = self.get_weight_decay(group)
@@ -436,23 +454,32 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                 update = self.rms_clip_(update)
 
             self.update_prodigy(state, group, p.grad, z_state)
+
+            # Apply AMOS weight decay to the update (before applying it)
+            if use_amos:
+                # Get xy_step from group (computed in update_params)
+                decay_factor_d, gamma = self.compute_amos_dynamic_decay(
+                    p, p.grad, state, group
+                )
+                extra_l2 = group['weight_decay']
+                
+                # Apply AMOS-style decay:
+                # 1. Scale the entire update by decay_factor_d
+                # 2. Apply dynamic weight decay to parameters
+                update.mul_(decay_factor_d)
+                
+                # Apply dynamic weight decay to parameters
+                param_decay = (gamma - extra_l2) / 2.0
+                if param_decay != 0:
+                    y.mul_(1.0 - param_decay)
+                    z.mul_(1.0 - param_decay)
+
             self.update_params(y, z, update, group, dlr)
 
             self.smart_copy(p, y, stochastic, True)
             self.smart_copy(z_state, z, stochastic, True)
 
             del update
-
-        # Apply AMOS weight decay after parameter update
-        if use_amos:
-            # Get xy_step from group (computed in update_params)
-            xy_step = group.get('effective_lr', dlr) / dlr if dlr > 0 else 1.0
-            decay = self.compute_amos_dynamic_decay(p, p.grad, state, group, dlr, xy_step=xy_step)
-            if decay != 0:
-                y.mul_(1.0 - decay)
-                z.mul_(1.0 - decay)
-                self.smart_copy(p, y, stochastic, False)
-                self.smart_copy(z_state, z, stochastic, False)
 
     @torch.no_grad()
     def step_param(self, p, group):

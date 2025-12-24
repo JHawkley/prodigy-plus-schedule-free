@@ -24,6 +24,11 @@ class CoreOptimiser(torch.optim.Optimizer):
         if kwargs['beta3'] is not None and not 0.0 <= kwargs['beta3'] < 1.0:
             raise ValueError("Invalid beta3 parameter: {}".format(kwargs['beta3']))
 
+        # AMOS parameter validation
+        if kwargs['use_amos']:
+            if kwargs['amos_c_coef'] < 0:
+                raise ValueError("Invalid amos_c_coef value: {}".format(kwargs['amos_c_coef']))
+
         self.try_hook_kohya_fbp()
 
         if kwargs['eps'] is None:
@@ -32,8 +37,8 @@ class CoreOptimiser(torch.optim.Optimizer):
                 self.log(f"'use_stableadamw' has been disabled (mutually exclusive with Adam-atan2).")
                 kwargs['use_stableadamw'] = False
 
-        # SPEED expects (mostly) unmodified weights during training to determine LR. If weight growth is dampened too much, 
-        # SPEED can massively overestimate the LR. This only seems to be a problem in certain edge cases; higher weight decay 
+        # SPEED expects (mostly) unmodified weights during training to determine LR. If weight growth is dampened too much,
+        # SPEED can massively overestimate the LR. This only seems to be a problem in certain edge cases; higher weight decay
         # should be fine for the most part, but warn the user anyway.
         if kwargs['use_speed'] and kwargs['weight_decay'] > 0:
             self.log(f"WARNING: Weight decay with 'use_speed' detected! If training becomes unstable, try lower values.")
@@ -239,6 +244,10 @@ class CoreOptimiser(torch.optim.Optimizer):
             if not group['use_speed']:
                 state['s'] = torch.zeros_like(sliced_data, memory_format=torch.preserve_format, dtype=dtype).detach()
 
+            # AMOS-specific state
+            if group['use_amos']:
+                state['amos_decay'] = torch.zeros((1,), dtype=p.dtype, device=p.device)
+
         return state, needs_init
 
     def get_betas(self, group):
@@ -248,6 +257,73 @@ class CoreOptimiser(torch.optim.Optimizer):
 
     def get_weight_decay(self, group):
         return group['weight_decay']
+
+    @staticmethod
+    def get_amos_scale(p: torch.Tensor) -> float:
+        r"""Get expected scale for model weights (AMOS).
+        
+        Based on initialization theory for neural networks:
+        - 1D tensors (biases): 0.5
+        - 2D tensors (linear layers): sqrt(2 / input_dim)
+        - Other (conv layers, embeddings): sqrt(1 / input_dim)
+        """
+        import math
+        if len(p.shape) == 1:
+            return 0.5
+        if len(p.shape) == 2:
+            return math.sqrt(2 / p.size(1))
+        return math.sqrt(1 / p.size(1))
+
+    @torch.no_grad()
+    def compute_amos_dynamic_decay(self, p, grad, state, group, dlr, xy_step=None):
+        r"""Compute AMOS-style dynamic weight decay.
+        
+        Args:
+            p: Parameter tensor
+            grad: Gradient tensor
+            state: Optimizer state
+            group: Parameter group
+            dlr: Dynamic learning rate from Prodigy
+            xy_step: Schedule-Free xy_step factor (None for non-Schedule-Free mode)
+        """
+        import math
+        
+        c_coef = group['amos_c_coef']
+        extra_l2 = group['weight_decay']
+        eps = group['eps'] if group['eps'] is not None else 1e-18
+        
+        # Compute mean squared gradient (current, not EMA)
+        g2 = grad.pow(2).mean()
+        
+        # Compute effective learning rate (actual step size)
+        if xy_step is not None:
+            # Schedule-Free mode
+            effective_lr = dlr * xy_step
+        else:
+            # Non-Schedule-Free mode
+            effective_lr = dlr
+        
+        # Get decay state
+        b = state['amos_decay']
+        
+        # Compute decay factor using effective_lr
+        lr_sq = math.sqrt(effective_lr)
+        decay_factor_c = torch.rsqrt(1.0 + c_coef * lr_sq * b)
+        
+        # Compute gamma (dynamic weight decay strength)
+        # Note: AMOS also uses decay_factor_d to scale the entire update, but Prodigy's
+        # update mechanism (y.sub_(update, alpha=dlr)) doesn't support additional
+        # multiplicative factors. The temporal smoothing from decay_factor_d is partially
+        # captured by the amos_decay state accumulation. This is a simplified adaptation.
+        gamma = decay_factor_c * (effective_lr ** 2) * g2 / (g2 + eps)
+        
+        # Compute effective decay (applied as multiplicative factor to parameters)
+        effective_decay = (extra_l2 - gamma) / 2.0
+        
+        # Update decay state
+        b.mul_(1.0 + gamma).add_(gamma)
+        
+        return effective_decay
 
     def get_bias_correction(self, dlr, beta2, k):
         beta2_t = beta2 ** k

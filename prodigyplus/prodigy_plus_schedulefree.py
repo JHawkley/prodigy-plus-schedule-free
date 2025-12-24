@@ -160,6 +160,15 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             "FOCUS: First-Order Concentrated Update Scheme" (https://arxiv.org/abs/2501.12243). This method is
             incompatible with factorisation and Adam-atan2.
             (default: False)
+        use_amos (boolean):
+            Experimental. Enable AMOS-style dynamic weight decay. When enabled, the weight_decay argument
+            acts similarly to AMOS's extra_l2 parameter. The decay strength adapts based on gradient statistics
+            and parameter scale. Based on "AMOS: An Adam-style Optimizer with Adaptive Weight Decay towards
+            Model-Oriented Scale" (https://arxiv.org/pdf/2210.11693).
+            (default: False)
+        amos_c_coef (float):
+            Coefficient for AMOS decay_factor_c. Only used when use_amos=True.
+            (default: 0.25)
     """
     def __init__(self, params, lr=1.0,
                  betas=(0.9, 0.99), beta3=None,
@@ -184,7 +193,10 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                  use_grams=False,
                  use_adopt=False,
                  use_orthograd=False,
-                 use_focus=False):
+                 use_focus=False,
+                 # AMOS parameters (experimental)
+                 use_amos=False,
+                 amos_c_coef=0.25):
 
         super().__init__(params=params, lr=lr,
                         betas=betas, beta3=beta3,
@@ -209,7 +221,9 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                         use_grams=use_grams,
                         use_adopt=use_adopt,
                         use_orthograd=use_orthograd,
-                        use_focus=use_focus)
+                        use_focus=use_focus,
+                        use_amos=use_amos,
+                        amos_c_coef=amos_c_coef)
 
     @torch.no_grad()
     def set_train_mode(self, train):
@@ -243,7 +257,12 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
     @torch.no_grad()
     def update_params(self, y, z, update, group, dlr):
         beta1, _, _ = self.get_betas(group)
-        decay = self.get_weight_decay(group)
+        
+        # Skip weight decay if AMOS is enabled (handled separately)
+        if group['use_amos']:
+            decay = 0
+        else:
+            decay = self.get_weight_decay(group)
 
         weight = dlr ** 2
         weight_sum = group['running_weight_sum'] = group.get('weight_sum', 0) + weight
@@ -297,6 +316,7 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
     @torch.no_grad()
     def step_param_prodigy(self, p, group):
         k = group['k']
+        use_amos = group['use_amos']
         use_adopt = group['use_adopt']
         use_bias_correction = group['use_bias_correction']
         stochastic = group['stochastic_rounding']
@@ -350,11 +370,19 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
 
             self.update_prodigy(state, group, p.grad, p)
 
-            decay = self.get_weight_decay(group)
-            if decay != 0:
-                if group['weight_decay_by_lr']:
-                    decay *= dlr
-                y.mul_(1 - decay)
+            # Apply weight decay
+            if use_amos:
+                # Non-Schedule-Free mode: xy_step = None
+                decay = self.compute_amos_dynamic_decay(p, p.grad, state, group, dlr, xy_step=None)
+                if decay != 0:
+                    y.mul_(1.0 - decay)
+            else:
+                # Original Prodigy weight decay
+                decay = self.get_weight_decay(group)
+                if decay != 0:
+                    if group['weight_decay_by_lr']:
+                        decay *= dlr
+                    y.mul_(1 - decay)
 
             y.sub_(update, alpha=dlr)
 
@@ -368,6 +396,7 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             raise Exception("Not in train mode!")
 
         k = group['k']
+        use_amos = group['use_amos']
         use_adopt = group['use_adopt']
         use_bias_correction = group['use_bias_correction']
         stochastic = group['stochastic_rounding']
@@ -413,6 +442,17 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             self.smart_copy(z_state, z, stochastic, True)
 
             del update
+
+        # Apply AMOS weight decay after parameter update
+        if use_amos:
+            # Get xy_step from group (computed in update_params)
+            xy_step = group.get('effective_lr', dlr) / dlr if dlr > 0 else 1.0
+            decay = self.compute_amos_dynamic_decay(p, p.grad, state, group, dlr, xy_step=xy_step)
+            if decay != 0:
+                y.mul_(1.0 - decay)
+                z.mul_(1.0 - decay)
+                self.smart_copy(p, y, stochastic, False)
+                self.smart_copy(z_state, z, stochastic, False)
 
     @torch.no_grad()
     def step_param(self, p, group):

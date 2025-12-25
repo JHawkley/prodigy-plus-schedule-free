@@ -379,7 +379,7 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             if use_amos:
                 # Non-Schedule-Free mode: xy_step = None
                 decay_factor_d, gamma = self.compute_amos_dynamic_decay(
-                    p, p.grad, state, group
+                    p, p.grad, state, group, dlr
                 )
                 extra_l2 = group['weight_decay']
                 
@@ -457,9 +457,8 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
 
             # Apply AMOS weight decay to the update (before applying it)
             if use_amos:
-                # Get xy_step from group (computed in update_params)
                 decay_factor_d, gamma = self.compute_amos_dynamic_decay(
-                    p, p.grad, state, group
+                    p, p.grad, state, group, dlr
                 )
                 extra_l2 = group['weight_decay']
                 

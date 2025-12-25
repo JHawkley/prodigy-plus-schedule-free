@@ -279,7 +279,7 @@ class CoreOptimiser(torch.optim.Optimizer):
         return math.sqrt(1 / p.size(1))
 
     @torch.no_grad()
-    def compute_amos_dynamic_decay(self, p, grad, state, group):
+    def compute_amos_dynamic_decay(self, p, grad, state, group, dlr):
         r"""Compute AMOS-style dynamic weight decay.
         
         Args:
@@ -287,6 +287,7 @@ class CoreOptimiser(torch.optim.Optimizer):
             grad: Gradient tensor
             state: Optimizer state
             group: Parameter group
+            dlr: Dynamic learning rate from Prodigy
         
         Returns:
             Tuple of (decay_factor_d, gamma)
@@ -312,22 +313,20 @@ class CoreOptimiser(torch.optim.Optimizer):
         # Compute r_v_hat = bias_correction / (exp_avg_sq + eps)
         # This is the inverse of the variance estimate
         r_v_hat = bias_correction / (amos_exp_avg_sq + eps)
-
-        effective_lr = group['effective_lr']
         
         # Get decay state
         b = state['amos_decay']
 
-        init_lr = effective_lr * self.get_amos_scale(p)
+        init_lr = dlr * self.get_amos_scale(p)
 
-        lr_sq = math.sqrt(effective_lr)
+        lr_sq = math.sqrt(dlr)
         decay_factor_c = torch.rsqrt(1.0 + c_coef * lr_sq * b)
         
         # Compute decay_factor_d (scales the entire update)
         decay_factor_d = torch.reciprocal(1.0 + d_coef * math.sqrt(init_lr) * b)
         
         # Compute gamma (dynamic weight decay strength)
-        gamma = decay_factor_c * (effective_lr ** 2) * r_v_hat * g2
+        gamma = decay_factor_c * (dlr ** 2) * r_v_hat * g2
         
         # Update decay state
         b.mul_(1.0 + gamma).add_(gamma)

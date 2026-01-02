@@ -156,10 +156,24 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             Can help prevent overfitting and improve generalisation.
             (default: False)
         use_focus (boolean):
-            Experimental. Modifies the update step to better handle noise at large step sizes. From 
+            Experimental. Modifies the update step to better handle noise at large step sizes. From
             "FOCUS: First-Order Concentrated Update Scheme" (https://arxiv.org/abs/2501.12243). This method is
             incompatible with factorisation and Adam-atan2.
             (default: False)
+        use_amos (boolean):
+            Experimental. Applies AMOS-style dynamic weight decay towards model-oriented scale, as described in
+            "Amos: An Adam-style Optimizer with Adaptive Weight Decay towards Model-Oriented Scale" (https://arxiv.org/abs/2210.11693).
+            This adds an adaptive L2 regularization that decays to 0 and is based on the current squared gradient.
+            The weight decay strength is computed as: gamma_t = c_t * (lr^2 / v_hat) * rms(g_t)^2, where c_t is a decay factor.
+            This supplements Prodigy's adaptive step size and does not replace it.
+            (default: False)
+        amos_c_coef (float):
+            Coefficient for AMOS decay factor c_t. Controls how quickly the weight decay decays.
+            (default: 0.25)
+        amos_eta (float, optional):
+            If not None, uses this fixed scale for all parameters instead of calculating it from parameter shape.
+            If None, the scale is automatically calculated based on parameter shape (bias: 0.5, linear: sqrt(1/fan_in)).
+            (default: None)
     """
     def __init__(self, params, lr=1.0,
                  betas=(0.9, 0.99), beta3=None,
@@ -184,9 +198,12 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                  use_grams=False,
                  use_adopt=False,
                  use_orthograd=False,
-                 use_focus=False):
+                 use_focus=False,
+                 use_amos=False,
+                 amos_c_coef=0.25,
+                 amos_eta=None):
 
-        super().__init__(params=params, lr=lr,
+       super().__init__(params=params, lr=lr,
                         betas=betas, beta3=beta3,
                         weight_decay=weight_decay,
                         weight_decay_by_lr=weight_decay_by_lr,
@@ -209,7 +226,10 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                         use_grams=use_grams,
                         use_adopt=use_adopt,
                         use_orthograd=use_orthograd,
-                        use_focus=use_focus)
+                        use_focus=use_focus,
+                        use_amos=use_amos,
+                        amos_c_coef=amos_c_coef,
+                        amos_eta=amos_eta)
 
     @torch.no_grad()
     def set_train_mode(self, train):
@@ -228,6 +248,31 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
     def train(self):
         self.set_train_mode(True)
 
+    @staticmethod
+    def get_amos_scale(p: torch.Tensor, amos_eta: float = None) -> float:
+        r"""Get expected scale for model weights based on parameter shape.
+        
+        Based on the AMOS paper's recommendations for different layer types:
+        - 1D parameters (bias): 0.5
+        - 2D parameters (linear kernels): sqrt(2 / fan_in) for MLP output layers, sqrt(1 / fan_in) otherwise
+        - Other parameters: sqrt(1 / fan_in)
+        
+        Args:
+            p: Parameter tensor
+            amos_eta: If not None, use this fixed scale for all parameters
+        
+        Returns:
+            Expected scale η for the parameter
+        """
+        if amos_eta is not None:
+            return amos_eta
+        
+        if len(p.shape) == 1:
+            return 0.5
+        if len(p.shape) == 2:
+            return (2 / p.size(1)) ** 0.5
+        return (1 / p.size(1)) ** 0.5
+
     @torch.no_grad()
     def initialise_state(self, p, group):
         state, needs_init = self.initialise_state_internal(p, group)
@@ -237,6 +282,11 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                 state['z'] = p.detach().clone(memory_format=torch.preserve_format)
             else:
                 state['exp_avg'] = torch.zeros_like(p.grad, memory_format=torch.preserve_format).detach()
+            
+            if group['use_amos']:
+                # AMOS-specific state variables
+                # amos_decay: b_t, tracks cumulative decay for c_t and d_t
+                state['amos_decay'] = torch.tensor(0.0, dtype=torch.float32, device=p.device)
 
         return state
 
@@ -295,6 +345,89 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
             del y_wd
 
     @torch.no_grad()
+    def get_amos_weight_decay(self, state, group, p, grad, dlr, beta2):
+        r"""Calculate AMOS-style dynamic weight decay.
+        
+        Based on AMOS paper, the weight decay strength is:
+            gamma_t = c_t * (lr^2 / v_hat) * rms(g_t)^2
+        
+        where:
+        - c_t is the decay factor for weight regularization
+        - lr is the learning rate
+        - v_hat is the bias-corrected second moment estimate
+        - rms(g_t) is the root mean square of the gradient
+        
+        The AMOS weight decay is then applied as:
+            update = update + (gamma_t / 2) * theta_t
+        
+        Note: We skip the d_t (learning rate decay factor) multiplication because
+        Prodigy already handles learning rate decay through its adaptive step size.
+        
+        Args:
+            state: Optimizer state for this parameter
+            group: Parameter group configuration
+            p: Parameter tensor
+            grad: Gradient tensor
+            dlr: Dynamic learning rate
+            beta2: Beta2 coefficient for bias correction
+            
+        Returns:
+            AMOS weight decay term to apply to update
+        """
+        # Use dynamic learning rate (dlr) instead of nominal lr for AMOS calculations
+        # This is especially important for Schedule-Free mode where effective LR can be much smaller
+        amos_c_coef = group['amos_c_coef']
+        amos_eta = group.get('amos_eta', None)
+        
+        # Calculate model-oriented scale (eta)
+        eta = self.get_amos_scale(p, amos_eta)
+        
+        # Get bias-corrected second moment estimate
+        # We use the existing exp_avg_sq for v_hat
+        if 'exp_avg_sq_metadata' in state:
+            # For factored second moment, compute mean of the combined estimate
+            row_var, col_var = state["exp_avg_sq_row"], state["exp_avg_sq_col"]
+            dr, dc = state["exp_avg_sq_metadata"]
+            reduce_dc = dc - 1 if dc > dr else dc
+            row_col_mean = row_var.mean(dim=reduce_dc, keepdim=True).add_(1e-30)
+            v_hat = (row_var.div(row_col_mean) * col_var).mean()
+        else:
+            v_hat = state['exp_avg_sq'].mean()
+        
+        # Bias correction for second moment
+        k = group['k']
+        bias_correction = 1 - beta2 ** k
+        v_hat = v_hat / bias_correction
+        
+        # Add epsilon to avoid division by very small numbers
+        eps = group.get('eps', 1e-8)
+        if eps is None:
+            eps = 1e-8  # Default for Adam-atan2
+        v_hat = v_hat + eps
+        
+        # Get AMOS decay state (b_t)
+        amos_decay = state['amos_decay']
+        
+        # Calculate AMOS decay factor
+        # c_t = 1 / sqrt(1 + c_coef * sqrt(lr) * b_t)
+        decay_factor_c = torch.rsqrt(1.0 + amos_c_coef * (dlr ** 0.5) * amos_decay)
+        
+        # Calculate gradient RMS
+        g_rms_sq = grad.pow(2).mean()
+        
+        # Calculate AMOS weight decay strength (gamma_t)
+        # gamma_t = c_t * (lr^2 / v_hat) * rms(g_t)^2
+        gamma = decay_factor_c * (dlr ** 2) * (1.0 / v_hat) * g_rms_sq
+        
+        # Update AMOS decay state
+        # b_{t+1} = b_t + gamma_t * (1 + b_t)
+        amos_decay.mul_(1.0 + gamma).add_(gamma)
+        
+        # Return the AMOS weight decay term
+        # The weight decay term is (gamma / 2) * theta
+        return gamma / 2.0
+
+    @torch.no_grad()
     def step_param_prodigy(self, p, group):
         k = group['k']
         use_adopt = group['use_adopt']
@@ -350,6 +483,12 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
 
             self.update_prodigy(state, group, p.grad, p)
 
+            # Apply AMOS weight decay if enabled
+            if group['use_amos']:
+                amos_wd = self.get_amos_weight_decay(state, group, y, grad, dlr, beta2)
+                # Apply AMOS weight decay: update = update + gamma_t/2 * theta_t
+                update.add_(y, alpha=amos_wd)
+            
             decay = self.get_weight_decay(group)
             if decay != 0:
                 if group['weight_decay_by_lr']:
@@ -407,6 +546,13 @@ class ProdigyPlusScheduleFree(CoreOptimiser):
                 update = self.rms_clip_(update)
 
             self.update_prodigy(state, group, p.grad, z_state)
+            
+            # Apply AMOS weight decay if enabled
+            if group['use_amos']:
+                amos_wd = self.get_amos_weight_decay(state, group, y, grad, dlr, beta2)
+                # Apply AMOS weight decay: update = update + gamma_t/2 * theta_t
+                update.add_(y, alpha=amos_wd)
+            
             self.update_params(y, z, update, group, dlr)
 
             self.smart_copy(p, y, stochastic, True)

@@ -23,6 +23,8 @@ class CoreOptimiser(torch.optim.Optimizer):
             raise ValueError("Invalid beta parameter at index 1: {}".format(kwargs['betas'][1]))
         if kwargs['beta3'] is not None and not 0.0 <= kwargs['beta3'] < 1.0:
             raise ValueError("Invalid beta3 parameter: {}".format(kwargs['beta3']))
+        if kwargs['amos_c_coef'] < 0:
+            raise ValueError("Invalid amos_c_coef value: {}".format(kwargs['amos_c_coef']))
 
         self.try_hook_kohya_fbp()
 
